@@ -22,19 +22,34 @@ from torchvision.transforms import (
 
 
 class Pertubation(torch.nn.Module):
-    def __init__(self, pad_h, pad_w, clip_model):
+    def __init__(self, pad_h, pad_w, clip_model, mapped=True, normalization=None, bias=False):
         super().__init__()
         self.mask = torch.ones((3, 224, 224))
         self.mask[:, pad_h: 224 - pad_h, pad_w: 224 - pad_w] = 0
+        self.mapped = mapped 
+        self.normalization = normalization
+        self.bias = bias
 
-        delta = torch.zeros((3, 224, 224))
-        delta.require_grad = True
-
-        self.perturbation = torch.nn.Parameter(
+        if self.mapped:
+            self.perturbation = None
+            self.register_buffer("random_tensor_input",torch.rand(1,784))
+            self.prompt_map_fn = torch.nn.Linear(784,3*224*224, bias=self.bias)
+            self.prompt_map_fn.weight.data.fill_(0.00)
+            if self.bias:
+                self.prompt_map_fn.bias.data.fill_(0.00)
+        else:
+            delta = torch.zeros((3, 224, 224))
+            delta.require_grad = True
+            self.perturbation = torch.nn.Parameter(
             delta.float(), requires_grad=True)
         self.model = clip_model
 
     def forward(self, images, text_inputs):
+        if self.mapped:
+            prompt_map = self.prompt_map_fn(self.random_tensor_input)
+            self.perturbation = prompt_map.view(3,224,224)
+            noise = self.perturbation.repeat(images.size(0),1,1,1)
+            images = self.normalization(noise + images)
         image_features = self.model.encode_image(images)
         text_features = self.model.encode_text(text_inputs)
         norm_image_features = image_features / \
@@ -86,6 +101,11 @@ def parse_option():
     parser.add_argument(
         "--epochs", type=int, default=1000, help="number of training epoch5s"
     )
+    parser.add_argument(
+        '--mapped',
+        action='store_true',
+        help='mapped_fn')
+
 
     # optimization
     parser.add_argument(
@@ -100,6 +120,12 @@ def parse_option():
         '--non_CLIP',
         action='store_true',
         help='Perform evaluation only')
+    parser.add_argument(
+        '--bias',
+        action='store_true',
+        help='Perform evaluation only')
+
+
     parser.add_argument(
         '--non_CLIP_model',
         type=str,
@@ -292,7 +318,9 @@ def main():
 
     # Initialize the prompt
     if not args.non_CLIP:
-        prompt = Pertubation(args.prompt_size, args.prompt_size, clip_model)
+        prompt = Pertubation(args.prompt_size, args.prompt_size, clip_model, args.mapped, normalization, args.bias)
+        if args.mapped:
+            prompt.to(device)
     else:
         prompt = Pertubation_non_CLIP(
             args.prompt_size, args.prompt_size, model)
@@ -301,7 +329,7 @@ def main():
 
     # Optimizer setting
     prompt.model.requires_grad_(False)
-    param_groups = add_weight_decay(prompt, 0.0, skip_list=("perturbation"))
+    param_groups = add_weight_decay(prompt, 0.0, skip_list=("perturbation", "prompt_map_fn.weight", "prompt_map_fn.bias"))
     print(param_groups)
     optimizer = torch.optim.SGD(param_groups, lr=lr)
     criterion = torch.nn.CrossEntropyLoss()
@@ -342,7 +370,10 @@ def main():
             if test_acc1 > max_acc:
                 max_acc = test_acc1
                 model_state = prompt.state_dict()
-                save_dict = {"perturbation": model_state["perturbation"]}
+                if not args.mapped:
+                     save_dict = {"perturbation": model_state["perturbation"]}
+                else:
+                    save_dict = model_state
                 save_path = args.save_path
                 if not os.path.exists(save_path):
                     os.makedirs(save_path)
@@ -410,29 +441,35 @@ def train_with_prompt(
         # Pad the image
         images = F.pad(images, pad_dim, "constant", value=0)
         images = images.to(device)
-        noise = prompt.perturbation.to(device)
-        noise = noise.repeat(images.size(0), 1, 1, 1)
-        noise.retain_grad()
+        if not args.mapped:
+            noise = prompt.perturbation.to(device)
+            noise = noise.repeat(images.size(0), 1, 1, 1)
+            noise.retain_grad()
 
-        # Normalize the image and noise
-        images = normalization(images + noise)
-        images.require_grad = True
+            # Normalize the image and noise
+            images = normalization(images + noise)
+            images.require_grad = True
 
         probs = prompt(images, text_inputs)
         if args.non_CLIP:
             probs = probs[:, matching_index]
         loss = criterion(probs, (labels).to(device))
+        if args.mapped:
+            optim.zero_grad()
         loss.backward()
 
         # update the perturbation
-        grad_p_t = noise.grad
-        grad_p_t = grad_p_t.mean(0).squeeze(0)
-        g_norm = torch.norm(grad_p_t.view(-1), dim=0).view(1, 1, 1)
-        scaled_g = grad_p_t / (g_norm + 1e-10)
-        scaled_g_pad = scaled_g * prompt.mask.to(device)
-        updated_pad = scaled_g_pad * lr
-        prompt.perturbation.data = prompt.perturbation.data - updated_pad.detach().cpu()
-        prompt.zero_grad()
+        if args.mapped:
+            optim.step()
+        else:
+             grad_p_t = noise.grad
+             grad_p_t = grad_p_t.mean(0).squeeze(0)
+             g_norm = torch.norm(grad_p_t.view(-1), dim=0).view(1, 1, 1)
+             scaled_g = grad_p_t / (g_norm + 1e-10)
+             scaled_g_pad = scaled_g * prompt.mask.to(device)
+             updated_pad = scaled_g_pad * lr
+             prompt.perturbation.data = prompt.perturbation.data - updated_pad.detach().cpu()
+             prompt.zero_grad()
 
         all_loss.append(loss.detach().cpu().numpy())
         top1, top5 = topk(probs, (labels).to(device), ks=(1, 5))
@@ -465,9 +502,10 @@ def eval(
         with torch.no_grad():
             images = F.pad(images, pad_dim, "constant", value=0)
             images = images.to(device)
-            noise = prompt.perturbation.to(device)
+            if not args.mapped:
+                noise = prompt.perturbation.to(device)
 
-            images = normalization(images + noise)
+                images = normalization(images + noise)
             probs = prompt(images, text_inputs)
             if args.non_CLIP:
                 probs = probs[:, matching_index]
