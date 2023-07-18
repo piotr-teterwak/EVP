@@ -1,3 +1,5 @@
 .onager/
 save/
+data/
 *__pycache__*
+*.npz

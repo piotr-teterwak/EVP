@@ -20,8 +20,6 @@ from util.tool import refine_classname, topk, _convert_image_to_rgb, add_weight_
 from util.get_index import get_index
 from util.data import cifar_100_coarse_labels, sparse2coarse
 from util.inaturalist_fns import get_inat_data, train_with_prompt_inaturalist, eval_with_inaturalist
-from util.flower_fns import get_flowers_data, eval_with_flowers, flowers_class_map
-from util.dtd_fns import get_dtd_data, eval_with_dtd
 from torchvision.transforms import (
     Compose,
     ToTensor,
@@ -30,11 +28,11 @@ from torchvision.transforms import (
 
 _tokenizer = _Tokenizer()
 
-SLURM_JOB_ID = os.environ.get('SLURM_ARRAY_JOB_ID')
+SLURM_JOB_ID = os.environ.get('SLURM_JOB_ID')
 SLURM_ARRAY_TASK_ID = os.environ.get('SLURM_ARRAY_TASK_ID')
 
 class Pertubation(torch.nn.Module):
-    def __init__(self, pad_h, pad_w, clip_model, mapped=True, normalization=None, bias=False, qformer=False, num_layers=12, representation_path=None, num_dummy_classes = 0, fixed_text_features = None, linear_probe_classes = -1, linear=False):
+    def __init__(self, pad_h, pad_w, clip_model, mapped=True, normalization=None, bias=False, qformer=False, num_layers=12, representation_path=None, num_dummy_classes = 0, fixed_text_features = None, linear_probe_classes = -1):
         super().__init__()
         mask = torch.ones((3, 224, 224))
         mask[:, pad_h: 224 - pad_h, pad_w: 224 - pad_w] = 0
@@ -43,7 +41,6 @@ class Pertubation(torch.nn.Module):
         self.normalization = normalization
         self.bias = bias
         self.qformer = qformer
-        self.linear = linear
         self.fixed_text_features = fixed_text_features
         self.encoded_features = None
         self.linear_probe_classes = linear_probe_classes
@@ -63,16 +60,6 @@ class Pertubation(torch.nn.Module):
                 class_representations = np.load(representation_path)
                 self.representation_array = torch.nn.ParameterList([torch.nn.Parameter(torch.Tensor(class_representations[idx]), requires_grad=False) for idx in class_representations])
             self.qformer = Blip2Qformer(input_width = 6656, embed_dim= 3*224*224, num_layers=num_layers)
-        elif self.linear:
-            self.perturbation = None
-            if num_dummy_classes > 0:
-                self.representation_array = torch.nn.ParameterList([torch.nn.Parameter(torch.ones((10,6656)), requires_grad=False) for idx in range(num_dummy_classes)])
-            else:
-                class_representations = np.load(representation_path)
-                self.representation_array = torch.nn.ParameterList([torch.nn.Parameter(torch.Tensor(class_representations[idx]), requires_grad=False) for idx in class_representations])
-            self.linear_fn = torch.nn.Linear(6656,3*224*224, bias=False)
-            self.linear_fn.weight.data.fill_(0.00)
-
         else:
             delta = torch.zeros((3, 224, 224))
             delta.require_grad = True
@@ -80,7 +67,7 @@ class Pertubation(torch.nn.Module):
             delta.float(), requires_grad=True)
 
         if self.linear_probe_classes > -1:
-            self.linear_probe = torch.nn.Embedding(self.linear_probe_classes, clip_model.visual.output_dim).half()
+            self.linear = torch.nn.Embedding(self.linear_probe_classes, clip_model.visual.output_dim).half()
         self.model = clip_model
 
     def set_text_features(self, input_text):
@@ -103,18 +90,6 @@ class Pertubation(torch.nn.Module):
             else:
                 reps = torch.concat(list(self.representation_array)).view(1,-1,6656)
             prompts = self.qformer(reps)[0,-1,:]
-            self.perturbation = prompts.view(3,224,224)
-            noise = self.perturbation * self.mask 
-            noise = noise.repeat(images.size(0),1,1,1)
-            images = self.normalization(noise + images)
-        elif self.linear:
-            if selected_labels is not None:
-                reps = torch.concat([self.representation_array[s] for s in selected_labels]).view(1,-1,6656)
-            else:
-                reps = torch.concat(list(self.representation_array)).view(1,-1,6656)
-            reps = reps /reps.norm(dim=1, keepdim=True)
-            reps = torch.mean(reps,dim=1)
-            prompts = self.linear_fn(reps)
             self.perturbation = prompts.view(3,224,224)
             noise = self.perturbation * self.mask 
             noise = noise.repeat(images.size(0),1,1,1)
@@ -198,16 +173,6 @@ def parse_option():
         '--qformer',
         action='store_true',
         help='use qformer')
-    parser.add_argument(
-        '--linear',
-        action='store_true',
-        help='use linear')
-
-    parser.add_argument(
-        '--clip_baseline',
-        action='store_true',
-        help='use qformer')
-
     parser.add_argument(
         '--constant-conditioning',
         action='store_true',
@@ -312,12 +277,6 @@ def parse_option():
         '--holdout_train',
         action='store_true',
         help='Holdout training samples')
-    parser.add_argument(
-        '--holdout_long',
-        action='store_true',
-        help='Holdout training samples')
-
-
 
 
 
@@ -452,25 +411,12 @@ def main():
 
 
     if args.dataset == 'inaturalist':
-        train_loader, test_loader = get_inat_data(args.root, args.batch_size, args.num_classes_per_batch, preprocess, preprocess_test, args.num_workers, args.holdout_class_idx, args.holdout_train, args.holdout_long)
+        train_loader, test_loader = get_inat_data(args.root, args.batch_size, args.num_classes_per_batch, preprocess, preprocess_test, args.num_workers, args.holdout_class_idx, args.holdout_train)
         classes = train_loader.dataset.ds.all_categories
         classes = [' '.join(c.split('_')) for c in classes]
         text_inputs = torch.concat([clip.tokenize(f"this is a photo of a {c}").to(device) for c in classes])
         train_text_inputs = text_inputs
         test_text_inputs = text_inputs
-    elif args.dataset == 'flowers':
-        train_loader, test_loader = get_flowers_data(args.root, args.batch_size, preprocess, preprocess_test, args.num_workers)
-        classes = flowers_class_map
-        text_inputs = torch.concat([clip.tokenize(f"this is a photo of a {c}").to(device) for c in classes.values()])
-        train_text_inputs = text_inputs
-        test_text_inputs = text_inputs
-    elif args.dataset == 'dtd':
-        train_loader, test_loader = get_dtd_data(args.root, args.batch_size, preprocess, preprocess_test, args.num_workers)
-        classes = test_loader.dataset.classes
-        text_inputs = torch.concat([clip.tokenize(f"this is a photo of a {c} texture").to(device) for c in classes])
-        train_text_inputs = text_inputs
-        test_text_inputs = text_inputs
-
     elif args.sample_coarse_labels:
         train_set = CIFAR100(
              args.root,
@@ -573,8 +519,8 @@ def main():
     # Initialize the prompt
 
     if not args.non_CLIP:
-        prompt = Pertubation(args.prompt_size, args.prompt_size, clip_model, args.mapped, normalization, args.bias, args.qformer, args.num_qformer_layers, args.representation_path, args.num_dummy_classes, args.fixed_text_features, args.linear_probe_classes, args.linear)
-        if args.mapped or args.qformer or args.linear:
+        prompt = Pertubation(args.prompt_size, args.prompt_size, clip_model, args.mapped, normalization, args.bias, args.qformer, args.num_qformer_layers, args.representation_path, args.num_dummy_classes, args.fixed_text_features, args.linear_probe_classes)
+        if args.mapped or args.qformer:
             prompt.to(device)
     else:
         prompt = Pertubation_non_CLIP(
@@ -586,13 +532,9 @@ def main():
     prompt.model.requires_grad_(False)
     if args.linear_probe_classes > -1:
         prompt.linear.requires_grad_(True)
-    if args.qformer or args.linear:
+    if args.qformer:
         #fix optimizer and params 
-        if args.qformer:
-            param_groups = prompt.qformer.get_optimizer_params(prompt, args.weight_decay)
-        else:
-            param_groups = add_weight_decay(prompt, 0.0, skip_list=("perturbation", "linear_fn.weight", "linear_fn.bias"))
-        #print(param_groups)
+        param_groups = prompt.qformer.get_optimizer_params(prompt, args.weight_decay)
         optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.98), eps=1e-05)
         schedule = LinearWarmupCosineLRScheduler(optimizer, epoch, 0.0, lr, 2000,0)
         criterion = torch.nn.CrossEntropyLoss()
@@ -606,12 +548,6 @@ def main():
     if args.dataset == 'inaturalist':
         train_fn = train_with_prompt_inaturalist 
         eval_fn = eval_with_inaturalist
-    elif args.dataset == 'flowers':
-        train_fn = None
-        eval_fn = eval_with_flowers
-    elif args.dataset == 'dtd':
-        train_fn = None
-        eval_fn = eval_with_dtd
     elif args.sample_coarse_labels:
         train_fn = train_with_prompt_coarse_labels
         eval_fn = eval_with_coarse_labels
@@ -628,21 +564,21 @@ def main():
             wandb.watch(prompt)
         print('Start Training')
         for e in range(epoch):
-            train_loss, train_top1 = train_fn(
-                args,
-                epoch=e,
-                train_loader=train_loader,
-                prompt=prompt,
-                text_inputs=train_text_inputs,
-                pad_dim=pad_dim,
-                criterion=criterion,
-                optim=optimizer,
-                normalization=normalization,
-                device=device,
-                matching_index=matching_index, 
-                schedule = schedule
-            )
-            if not args.qformer and not args.linear:
+           # train_loss, train_top1 = train_fn(
+           #     args,
+           #     epoch=e,
+           #     train_loader=train_loader,
+           #     prompt=prompt,
+           #     text_inputs=train_text_inputs,
+           #     pad_dim=pad_dim,
+           #     criterion=criterion,
+           #     optim=optimizer,
+           #     normalization=normalization,
+           #     device=device,
+           #     matching_index=matching_index, 
+           #     schedule = schedule
+           # )
+            if not args.qformer:
                 schedule.step()
             test_acc1, test_acc5 = eval_fn(
                 args,
@@ -657,7 +593,7 @@ def main():
             if test_acc1 > max_acc:
                 max_acc = test_acc1
             model_state = prompt.state_dict()
-            if not args.mapped and not args.qformer and not args.linear:
+            if not args.mapped and not args.qformer:
                  save_dict = {"perturbation": model_state["perturbation"]}
             else:
                 save_dict = model_state
@@ -689,21 +625,21 @@ def main():
         checkpoint = args.checkpoint
         state_dict = torch.load(checkpoint, map_location="cpu")
         perturbation_state = prompt.state_dict()
-        if not args.mapped and not args.qformer:
-            perturbation_state["perturbation"] = state_dict["perturbation"]
-        elif args.clip_baseline:
-            pass
-        else:
-            perturbation_state = state_dict
-            perturbation_state = {k:v for k,v in perturbation_state.items() if 'representation_array' not in k}
-        prompt.load_state_dict(perturbation_state, strict=False)
+        perturbation_state["perturbation"] = state_dict["perturbation"]
+        prompt.load_state_dict(perturbation_state)
 
+        test_loader = DataLoader(
+            test_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=args.num_workers,
+        )
         test_acc1, test_acc5 = eval_fn(
-            args,
             test_loader=test_loader,
             prompt=prompt,
             pad_dim=pad_dim,
-            text_inputs=test_text_inputs,
+            text_inputs=text_inputs,
             normalization=normalization,
             device=device,
             matching_index=matching_index
@@ -750,12 +686,12 @@ def train_with_prompt(
         if args.non_CLIP:
             probs = probs[:, matching_index]
         loss = criterion(probs, (labels).to(device))
-        if args.mapped or args.qformer or args.linear:
+        if args.mapped or args.qformer:
             optim.zero_grad()
         loss.backward()
 
         # update the perturbation
-        if args.mapped or args.qformer or args.linear:
+        if args.mapped or args.qformer:
             optim.step()
             pass
         else:
@@ -833,7 +769,7 @@ def train_with_prompt_coarse_labels(
         schedule.step(epoch, idx)
         images = F.pad(images, pad_dim, "constant", value=0)
         images = images.to(device)
-        if not args.mapped and not args.qformer and not args.linear:
+        if not args.mapped and not args.qformer:
             noise = prompt.perturbation.to(device)
             noise = noise.repeat(images.size(0), 1, 1, 1)
             noise.retain_grad()
@@ -845,12 +781,12 @@ def train_with_prompt_coarse_labels(
         if args.non_CLIP:
             probs = probs[:, matching_index]
         loss = criterion(probs, (remapped_labels).to(device))
-        if args.mapped or args.qformer or args.linear:
+        if args.mapped or args.qformer:
             optim.zero_grad()
         loss.backward()
 
         # update the perturbation
-        if args.mapped or args.qformer or args.linear:
+        if args.mapped or args.qformer:
             optim.step()
         else:
              grad_p_t = noise.grad
@@ -898,7 +834,7 @@ def eval(
         with torch.no_grad():
             images = F.pad(images, pad_dim, "constant", value=0)
             images = images.to(device)
-            if not args.mapped and not args.qformer and not args.linear:
+            if not args.mapped and not args.qformer:
                 noise = prompt.perturbation.to(device)
 
                 images = normalization(images + noise)
@@ -946,7 +882,7 @@ def eval_with_coarse_labels(
         
             images = F.pad(images, pad_dim, "constant", value=0)
             images = images.to(device)
-            if not args.mapped and not args.qformer and not args.linear:
+            if not args.mapped and not args.qformer:
                 noise = prompt.perturbation.to(device)
 
                 images = normalization(images + noise)
