@@ -9,7 +9,7 @@ from multiprocessing.pool import Pool
 from tqdm import *
 
 IMG_DIR='data/iNaturalist-2021/2021_train/'
-DST_DIR='/fsx/pteterwak/data/iNaturalist-2021-resized/2021_train'
+DST_DIR='/fsx/pteterwak/data/iNaturalist-2021-resized-164/2021_train'
 
 in_files = glob.glob(IMG_DIR+"*/*.jpg")
 
@@ -19,10 +19,10 @@ def read_images():
         (h, w) = image.shape[:2]
         aspect_ratio = h/w
         if h < w:
-            resized_image_size = (int(256/aspect_ratio) , 256)
+            resized_image_size = (int(164/aspect_ratio) , 164)
         else:
-            resized_image_size = (256, int(256 * aspect_ratio))
-        resized_img = cv2.resize(image/255.0  , resized_image_size)
+            resized_image_size = (164, int(164 * aspect_ratio))
+        resized_img = cv2.resize(image, resized_image_size)
 
         yield (img, image, resized_img)
 

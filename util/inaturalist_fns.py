@@ -303,4 +303,51 @@ def eval_with_inaturalist(
 
 
 
+def model_prompts_inaturalist(
+    args,
+    train_loader,
+    prompt,
+    text_inputs,
+    pad_dim,
+    normalization,
+    device,
+    matching_index,
+):
+    start_time = time.time()
+    all_prompt = []
+    idx = 0
+
+    with tqdm(train_loader, total = len(train_loader.dataset)//args.batch_size , unit="batch") as tepoch: 
+        for (images, labels) in  tepoch:
+             # Pad the imag
+             images = F.pad(images, pad_dim, "constant", value=0)
+             images = images.to(device)
+             labels = labels.to(device)
+             sampled_labels, remapped_labels = torch.unique(labels , sorted=False, return_inverse=True)
+             if not args.fixed_text_features:
+                sampled_text_inputs = text_inputs[sampled_labels]
+             else: 
+                 sampled_text_inputs = text_inputs
+                 repmapped_labels = labels
+             selected_labels = sampled_labels 
+             pred_prompt = prompt(images, sampled_text_inputs, selected_labels, return_prompt=True)
+
+             all_prompt.append(pred_prompt)
+             idx += 1
+
+             if idx > 100:
+                 break
+
+
+    all_prompt_np = torch.stack(all_prompt).cpu().detach().numpy()
+    mean = np.mean(all_prompt_np, axis=0)
+    var = np.var(all_prompt_np, axis=0)
+    1/0
+
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+
+    return mean, var
+
 

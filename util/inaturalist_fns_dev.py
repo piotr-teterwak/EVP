@@ -27,7 +27,7 @@ HOLDOUT_CLASS_IDX =  [
  [3973, 6481, 6964, 5475, 5202, 1658, 1673, 2596, 1573, 6912]] 
 
 
-HOLDOUT_CLASS_IDX_LONG = np.load('holdout_class_list/100_100_classes.npy').tolist()
+HOLDOUT_CLASS_IDX_LONG = np.load('holdout_class_lists/100_100_classes.npy').tolist()
 
 
 class ClassSampledINaturalist(torch.utils.data.Dataset):
@@ -170,7 +170,8 @@ def get_inat_data(data_path, batch_size, num_classes_per_batch, preprocess, prep
     test_ds = ClassSubsampledINaturalist(INaturalist(data_path, version='2021_valid', transform=preprocess_test), class_idx=class_idx)	
     train_sampler = ClassSampler(train_ds.classes(), num_classes_per_batch ,batch_size)
     train_dl = torch.utils.data.DataLoader(train_ds, batch_sampler = train_sampler, pin_memory=True, num_workers=num_workers)
-    test_dl = torch.utils.data.DataLoader(test_ds, shuffle=False, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
+    #train_dl = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=False, num_workers=num_workers)
+    test_dl = torch.utils.data.DataLoader(test_ds, shuffle=False, batch_size=batch_size, pin_memory=False, num_workers=num_workers)
     return (train_dl, test_dl)
 
 
@@ -198,11 +199,12 @@ def train_with_prompt_inaturalist(
     with tqdm(train_loader, total = len(train_loader.dataset)//args.batch_size , unit="batch") as tepoch: 
         for (images, labels) in  tepoch:
              # Pad the imag
-             if args.qformer:
+             if args.qformer or args.linear:
                 schedule.step(epoch, idx)
              tepoch.set_description(f"Epoch {epoch}")
              images = F.pad(images, pad_dim, "constant", value=0)
              images = images.to(device)
+             labels = labels.to(device)
              sampled_labels, remapped_labels = torch.unique(labels , sorted=False, return_inverse=True)
              if not args.fixed_text_features:
                 sampled_text_inputs = text_inputs[sampled_labels]
@@ -210,7 +212,7 @@ def train_with_prompt_inaturalist(
                  sampled_text_inputs = text_inputs
                  repmapped_labels = labels
              selected_labels = sampled_labels 
-             if not args.mapped and not args.qformer:
+             if not args.mapped and not args.qformer and not args.linear:
                  noise = prompt.perturbation.to(device)
                  noise = noise.repeat(images.size(0), 1, 1, 1)
                  noise.retain_grad()
@@ -221,13 +223,13 @@ def train_with_prompt_inaturalist(
              probs = prompt(images, sampled_text_inputs, selected_labels)
              if args.non_CLIP:
                  probs = probs[:, matching_index]
-             loss = criterion(probs, (remapped_labels).to(device))
-             if args.mapped or args.qformer:
+             loss = criterion(probs, remapped_labels)
+             if args.mapped or args.qformer or args.linear:
                  optim.zero_grad()
              loss.backward()
 
              # update the perturbation
-             if args.mapped or args.qformer:
+             if args.mapped or args.qformer or args.linear:
                  optim.step()
              else:
                   grad_p_t = noise.grad
@@ -240,7 +242,7 @@ def train_with_prompt_inaturalist(
                   prompt.zero_grad()
 
              all_loss.append(loss.detach().cpu().numpy())
-             top1, top5 = topk(probs, (remapped_labels).to(device), ks=(1, 5))
+             top1 = topk(probs, (remapped_labels).to(device), ks=(1,))[0]
              all_top1.extend(top1.cpu())
              idx += 1
              if (idx % 100 == 0):
@@ -274,17 +276,22 @@ def eval_with_inaturalist(
              with torch.no_grad():
                  images = F.pad(images, pad_dim, "constant", value=0)
                  images = images.to(device)
-                 sampled_labels, remapped_labels = torch.unique(labels, sorted = False, return_inverse=True)
-                 sampled_text_inputs = text_inputs[sampled_labels]
-                 selected_labels = sampled_labels 
-                 if not args.mapped and not args.qformer:
+                 sampled_labels, remapped_labels = torch.unique(torch.Tensor(test_loader.dataset.class_idx).long(), sorted = False, return_inverse=True)
+                 remap_dict = {a.item():b.item() for a,b in zip(sampled_labels, remapped_labels)}
+                 remap_tuple_list= list(remap_dict.items())
+                 remap_tuple_list.sort(key= lambda x: x[1])  
+                 sorted_sample_labels = [a for a,b in remap_tuple_list]
+                 sampled_text_inputs = text_inputs[sorted_sample_labels]
+                 new_labels = torch.tensor([remap_dict[x.item()] for x in labels])
+                 selected_labels = new_labels 
+                 if not args.mapped and not args.qformer and not args.linear:
                      noise = prompt.perturbation.to(device)
 
                      images = normalization(images + noise)
                  probs = prompt(images, sampled_text_inputs, selected_labels)
                  if args.non_CLIP:
                      probs = probs[:, matching_index]
-                 top1, top5 = topk(probs, (remapped_labels).to(device), ks=(1, 5))
+                 top1, top5 = topk(probs, (new_labels).to(device), ks=(1, 5))
                  all_top1.extend(top1.cpu())
                  all_top5.extend(top5.cpu())
     total_time = time.time() - start_time
@@ -295,5 +302,59 @@ def eval_with_inaturalist(
     return np.mean(all_top1), np.mean(all_top5)
 
 
+
+def model_prompts_inaturalist(
+    args,
+    epoch,
+    train_loader,
+    prompt,
+    text_inputs,
+    pad_dim,
+    criterion,
+    optim,
+    normalization,
+    device,
+    matching_index,
+    schedule
+):
+    start_time = time.time()
+    lr = optim.param_groups[0]["lr"]
+    all_prompt = []
+    idx = 0
+
+    with tqdm(train_loader, total = len(train_loader.dataset)//args.batch_size , unit="batch") as tepoch: 
+        for (images, labels) in  tepoch:
+             # Pad the imag
+             if args.qformer or args.linear:
+                schedule.step(epoch, idx)
+             tepoch.set_description(f"Epoch {epoch}")
+             images = F.pad(images, pad_dim, "constant", value=0)
+             images = images.to(device)
+             labels = labels.to(device)
+             sampled_labels, remapped_labels = torch.unique(labels , sorted=False, return_inverse=True)
+             if not args.fixed_text_features:
+                sampled_text_inputs = text_inputs[sampled_labels]
+             else: 
+                 sampled_text_inputs = text_inputs
+                 repmapped_labels = labels
+             selected_labels = sampled_labels 
+             _ = prompt(images, sampled_text_inputs, selected_labels)
+
+             all_prompt.extend(prompt)
+
+             idx += 1
+
+             if idx > 100:
+                 break
+
+
+    all_prompt_np = np.stack(all_prompt)
+    mean = np.mean(all_prompt_np, axis=0)
+    cov = np.cov(all_prompt_np, rowvar=0)
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+
+    return mean, cov
 
 
