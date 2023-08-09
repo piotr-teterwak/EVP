@@ -30,13 +30,20 @@ from util.inaturalist_fns import (
     eval_with_inaturalist,
     model_prompts_inaturalist,
 )
-from util.flower_fns import (
-    get_flowers_data,
-    eval_with_flowers,
-    flowers_class_map,
-    train_with_prompt_flowers,
-)
-from util.dtd_fns import get_dtd_data, eval_with_dtd
+from util.flowers_data import get_flowers_data, flowers_class_map
+from util.flowers_data import HOLDOUT_CLASS_IDX as HOLDOUT_CLASSES_FLOWERS
+from util.dtd_data import get_dtd_data
+from util.dtd_data import HOLDOUT_CLASS_IDX as HOLDOUT_CLASSES_DTD
+from util.eurosat_data import get_eurosat_data
+from util.eurosat_data import HOLDOUT_CLASS_IDX as HOLDOUT_CLASSES_EUROSAT
+from util.cars_data import get_cars_data
+from util.cars_data import HOLDOUT_CLASS_IDX as HOLDOUT_CLASSES_CARS
+from util.svhn_data import get_svhn_data
+from util.svhn_data import HOLDOUT_CLASS_IDX as HOLDOUT_CLASSES_SVHN
+from util.cifar_data import get_cifar100_data
+from util.cifar_data import HOLDOUT_CLASS_IDX as HOLDOUT_CLASSES_CIFAR
+from util.train_util import train_with_prompt_vpn, eval_with_vpn
+from util.layers import MeanCenterLayer
 from torchvision.transforms import (
     Compose,
     ToTensor,
@@ -66,7 +73,10 @@ class Pertubation(torch.nn.Module):
         linear_probe_classes=-1,
         linear=False,
         classnames=None,
-        prompt_tuning=False
+        prompt_tuning=False,
+        center_mean=False,
+        spectral_norm= False,
+        input_norm = False
     ):
         super().__init__()
         mask = torch.ones((3, 224, 224))
@@ -81,6 +91,11 @@ class Pertubation(torch.nn.Module):
         self.encoded_features = None
         self.linear_probe_classes = linear_probe_classes
         self.prompt_tuning = prompt_tuning
+        self.center_mean = center_mean
+        self.spectral_norm = spectral_norm
+        self.input_norm = input_norm
+        if self.center_mean:
+            self.mean_center = MeanCenterLayer(3* 224 * 224)
         if self.prompt_tuning:
             self.text_encoder = TextEncoder(clip_model)
             self.prompt_learner = PromptLearner(classnames, clip_model)
@@ -137,7 +152,12 @@ class Pertubation(torch.nn.Module):
                     ]
                 )
             self.linear_fn = torch.nn.Linear(6656, 3 * 224 * 224, bias=False)
+            if self.spectral_norm:
+                self.linear_fn = torch.nn.utils.parametrizations.spectral_norm(self.linear_fn)
+
             self.linear_fn.weight.data.fill_(0.00)
+            self.reps_averaged = torch.stack([torch.mean(torch.stack([r/r.norm(dim=0) for r in seq]), dim=0) for seq in self.representation_array]).cuda()
+            self.reps_center = torch.mean(self.reps_averaged, dim=0, keepdim=True)
 
         else:
             delta = torch.zeros((3, 224, 224))
@@ -172,20 +192,33 @@ class Pertubation(torch.nn.Module):
             else:
                 reps = torch.concat(list(self.representation_array)).view(1, -1, 6656)
             prompts = self.qformer(reps)[0, -1, :]
+            if self.center_mean:
+                prompts = self.mean_center(prompts)
             self.perturbation = prompts.view(3, 224, 224)
             noise = self.perturbation * self.mask
             noise = noise.repeat(images.size(0), 1, 1, 1)
             images = self.normalization(noise + images)
         elif self.linear:
             if selected_labels is not None:
-                reps = torch.concat(
-                    [self.representation_array[s] for s in selected_labels]
-                ).view(1, -1, 6656)
+                #reps_averaged = [torch.mean([r/r.norm(dim=0) for r in seq], dim=0) for seq in self.representation_array]
+                if self.input_norm:
+                    reps_selected = self.reps_averaged[selected_labels]
+                    reps = reps_selected - self.reps_center
+                    reps = torch.mean(reps, dim=0)
+                    reps = reps / reps.norm(dim=0, keepdim=True)
+                else:
+                    reps = torch.concat(
+                        [self.representation_array[s] for s in selected_labels]
+                    ).view(1, -1, 6656)
             else:
                 reps = torch.concat(list(self.representation_array)).view(1, -1, 6656)
-            reps = reps / reps.norm(dim=1, keepdim=True)
-            reps = torch.mean(reps, dim=1)
+            if not self.input_norm:
+                reps = reps / reps.norm(dim=2, keepdim=True)
+                reps = torch.mean(reps, dim=1)
+ 
             prompts = self.linear_fn(reps)
+            if self.center_mean:
+                prompts = self.mean_center(prompts)
             self.perturbation = prompts.view(3, 224, 224)
             noise = self.perturbation * self.mask
             noise = noise.repeat(images.size(0), 1, 1, 1)
@@ -254,12 +287,21 @@ def parse_option():
     parser.add_argument("--mapped", action="store_true", help="mapped_fn")
     parser.add_argument("--qformer", action="store_true", help="use qformer")
     parser.add_argument("--linear", action="store_true", help="use linear")
+    parser.add_argument("--spectral-norm", action="store_true", help="use spectral norm")
 
     parser.add_argument("--clip_baseline", action="store_true", help="use qformer")
 
     parser.add_argument(
         "--constant-conditioning", action="store_true", help="use qformer"
     )
+    parser.add_argument(
+        "--center-mean", action="store_true", help="demean"
+    )
+    parser.add_argument(
+        "--input-norm", action="store_true", help="demean"
+    )
+
+
     parser.add_argument(
         "--fixed_text_features", action="store_true", help="precompute text features"
     )
@@ -475,6 +517,7 @@ def main():
         )
         train_text_inputs = text_inputs
         test_text_inputs = text_inputs
+        class_idx_list = None
     elif args.dataset == "flowers":
         train_loader, test_loader = get_flowers_data(
             args.root,
@@ -491,12 +534,24 @@ def main():
             [clip.tokenize(f"this is a photo of a {c}").to(device) for c in classes]
         )
         train_text_inputs = text_inputs
-        test_text_inputs = text_inputs
+        if args.holdout_class_idx > -1:
+            test_text_inputs = torch.stack([text_inputs[i] for i in HOLDOUT_CLASSES_FLOWERS[args.holdout_class_idx]])
+            class_idx_list = HOLDOUT_CLASSES_FLOWERS[args.holdout_class_idx]
+        else: 
+            test_text_inputs = text_inputs
+            class_idx_list = list(range(len(train_text_inputs)))
     elif args.dataset == "dtd":
         train_loader, test_loader = get_dtd_data(
-            args.root, args.batch_size, preprocess, preprocess_test, args.num_workers
+            args.root,
+            args.batch_size,
+            args.num_classes_per_batch,
+            preprocess,
+            preprocess_test,
+            args.num_workers,
+            args.holdout_class_idx,
+            args.holdout_train,
         )
-        classes = test_loader.dataset.classes
+        classes = test_loader.dataset.ds.classes
         text_inputs = torch.concat(
             [
                 clip.tokenize(f"this is a photo of a {c} texture").to(device)
@@ -504,7 +559,114 @@ def main():
             ]
         )
         train_text_inputs = text_inputs
-        test_text_inputs = text_inputs
+        if args.holdout_class_idx > -1:
+            test_text_inputs = torch.stack([text_inputs[i] for i in HOLDOUT_CLASSES_DTD[args.holdout_class_idx]])
+            class_idx_list = HOLDOUT_CLASSES_DTD[args.holdout_class_idx]
+        else: 
+            test_text_inputs = text_inputs
+            class_idx_list = list(range(len(train_text_inputs)))
+    elif args.dataset == "eurosat":
+        train_loader, test_loader = get_eurosat_data(
+            args.root,
+            args.batch_size,
+            args.num_classes_per_batch,
+            preprocess,
+            preprocess_test,
+            args.num_workers,
+            args.holdout_class_idx,
+            args.holdout_train,
+        )
+        classes = test_loader.dataset.ds.dataset.classes
+        text_inputs = torch.concat(
+            [
+                clip.tokenize(f"this is a photo of a {c}").to(device)
+                for c in classes
+            ]
+        )
+        train_text_inputs = text_inputs
+        if args.holdout_class_idx > -1:
+            test_text_inputs = torch.stack([text_inputs[i] for i in HOLDOUT_CLASSES_EUROSAT[args.holdout_class_idx]])
+            class_idx_list = HOLDOUT_CLASSES_EUROSAT[args.holdout_class_idx]
+        else: 
+            test_text_inputs = text_inputs
+            class_idx_list = list(range(len(train_text_inputs)))
+    elif args.dataset == "cars":
+        train_loader, test_loader = get_cars_data(
+            args.root,
+            args.batch_size,
+            args.num_classes_per_batch,
+            preprocess,
+            preprocess_test,
+            args.num_workers,
+            args.holdout_class_idx,
+            args.holdout_train,
+        )
+        classes = test_loader.dataset.ds.classes
+        text_inputs = torch.concat(
+            [
+                clip.tokenize(f"this is a photo of a {c}").to(device)
+                for c in classes
+            ]
+        )
+        train_text_inputs = text_inputs
+        if args.holdout_class_idx > -1:
+            test_text_inputs = torch.stack([text_inputs[i] for i in HOLDOUT_CLASSES_CARS[args.holdout_class_idx]])
+            class_idx_list = HOLDOUT_CLASSES_CARS[args.holdout_class_idx]
+        else: 
+            test_text_inputs = text_inputs
+            class_idx_list = list(range(len(train_text_inputs)))
+    elif args.dataset == "svhn":
+        train_loader, test_loader = get_svhn_data(
+            args.root,
+            args.batch_size,
+            args.num_classes_per_batch,
+            preprocess,
+            preprocess_test,
+            args.num_workers,
+            args.holdout_class_idx,
+            args.holdout_train,
+        )
+        classes = [str(i) for i in range(10)]
+        text_inputs = torch.concat(
+            [
+                clip.tokenize(f"this is a photo of a {c}").to(device)
+                for c in classes
+            ]
+        )
+        train_text_inputs = text_inputs
+        if args.holdout_class_idx > -1:
+            test_text_inputs = torch.stack([text_inputs[i] for i in HOLDOUT_CLASSES_SVHN[args.holdout_class_idx]])
+            class_idx_list = HOLDOUT_CLASSES_SVHN[args.holdout_class_idx]
+        else: 
+            test_text_inputs = text_inputs
+            class_idx_list = list(range(len(train_text_inputs)))
+    elif args.dataset == "cifar":
+        train_loader, test_loader = get_cifar100_data(
+            args.root,
+            args.batch_size,
+            args.num_classes_per_batch,
+            preprocess,
+            preprocess_test,
+            args.num_workers,
+            args.holdout_class_idx,
+            args.holdout_train,
+        )
+        classes = test_loader.dataset.ds.classes
+        text_inputs = torch.concat(
+            [
+                clip.tokenize(f"this is a photo of a {c}").to(device)
+                for c in classes
+            ]
+        )
+        train_text_inputs = text_inputs
+        if args.holdout_class_idx > -1:
+            test_text_inputs = torch.stack([text_inputs[i] for i in HOLDOUT_CLASSES_CIFAR[args.holdout_class_idx]])
+            class_idx_list = HOLDOUT_CLASSES_CIFAR[args.holdout_class_idx]
+        else: 
+            test_text_inputs = text_inputs
+            class_idx_list = list(range(len(test_text_inputs)))
+
+
 
     elif args.sample_coarse_labels:
         train_set = CIFAR100(args.root, download=True, train=True, transform=preprocess)
@@ -631,7 +793,10 @@ def main():
             args.linear_probe_classes,
             args.linear,
             classes,
-            args.prompt_tuning
+            args.prompt_tuning,
+            args.center_mean,
+            args.spectral_norm,
+            args.input_norm
         )
         if args.mapped or args.qformer or args.linear:
             prompt.to(device)
@@ -701,12 +866,9 @@ def main():
         train_fn = train_with_prompt_inaturalist
         eval_fn = eval_with_inaturalist
         prompt_model_fn = model_prompts_inaturalist
-    elif args.dataset == "flowers":
-        train_fn = train_with_prompt_flowers
-        eval_fn = eval_with_flowers
-    elif args.dataset == "dtd":
-        train_fn = None
-        eval_fn = eval_with_dtd
+    elif args.dataset in ["flowers","dtd", "eurosat", "cars", "svhn", "cifar"]:
+        train_fn = train_with_prompt_vpn
+        eval_fn = eval_with_vpn
     elif args.sample_coarse_labels:
         train_fn = train_with_prompt_coarse_labels
         eval_fn = eval_with_coarse_labels
@@ -751,12 +913,15 @@ def main():
                 normalization=normalization,
                 device=device,
                 matching_index=matching_index,
+                class_idx_list=class_idx_list
             )
             if test_acc1 > max_acc:
                 max_acc = test_acc1
             model_state = prompt.state_dict()
             if not args.mapped and not args.qformer and not args.linear:
                 save_dict = {"perturbation": model_state["perturbation"]}
+                if args.prompt_tuning:
+                    save_dict["prompt_learner.ctx"] =  model_state["prompt_learner.ctx"]
             else:
                 save_dict = model_state
             save_path = args.save_path
@@ -787,8 +952,10 @@ def main():
         checkpoint = args.checkpoint
         state_dict = torch.load(checkpoint, map_location="cpu")
         perturbation_state = prompt.state_dict()
-        if not args.mapped and not args.qformer:
+        if not args.mapped and not args.qformer and not args.linear:
             perturbation_state["perturbation"] = state_dict["perturbation"]
+            if args.prompt_tuning:
+                perturbation_state["prompt_learner.ctx"] = state_dict["prompt_learner.ctx"]
         elif args.clip_baseline:
             pass
         else:
@@ -809,6 +976,7 @@ def main():
             normalization=normalization,
             device=device,
             matching_index=matching_index,
+            class_idx_list=class_idx_list
         )
         print("Test acc1 is {}".format(str(test_acc1)))
     elif args.model_prompts:
@@ -818,8 +986,9 @@ def main():
             checkpoint = args.checkpoint
             state_dict = torch.load(checkpoint, map_location="cpu")
             perturbation_state = prompt.state_dict()
-            if not args.mapped and not args.qformer:
+            if not args.mapped and not args.qformer and not args.linear:
                 perturbation_state["perturbation"] = state_dict["perturbation"]
+                pertubation_state["prompt_learner.ctx"] = state_dict["prompt_learner.ctx"]
             elif args.clip_baseline:
                 pass
             else:

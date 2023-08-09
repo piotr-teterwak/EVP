@@ -185,6 +185,7 @@ def train_with_prompt_inaturalist(
     pad_dim,
     criterion,
     optim,
+    text_optim,
     normalization,
     device,
     matching_index,
@@ -266,7 +267,8 @@ def eval_with_inaturalist(
         text_inputs,
         normalization,
         device,
-        matching_index):
+        matching_index,
+        class_idx_list=None):
     start_time = time.time()
     all_top1, all_top5 = [], []
     prompt.fixed_text_features = False

@@ -185,6 +185,7 @@ def train_with_prompt_inaturalist(
     pad_dim,
     criterion,
     optim,
+    text_optim,
     normalization,
     device,
     matching_index,
@@ -199,6 +200,8 @@ def train_with_prompt_inaturalist(
     with tqdm(train_loader, total = len(train_loader.dataset)//args.batch_size , unit="batch") as tepoch: 
         for (images, labels) in  tepoch:
              # Pad the imag
+             if idx > 200: 
+                1/0
              if args.qformer or args.linear:
                 schedule.step(epoch, idx)
              tepoch.set_description(f"Epoch {epoch}")
@@ -305,29 +308,21 @@ def eval_with_inaturalist(
 
 def model_prompts_inaturalist(
     args,
-    epoch,
     train_loader,
     prompt,
     text_inputs,
     pad_dim,
-    criterion,
-    optim,
     normalization,
     device,
     matching_index,
-    schedule
 ):
     start_time = time.time()
-    lr = optim.param_groups[0]["lr"]
     all_prompt = []
     idx = 0
 
     with tqdm(train_loader, total = len(train_loader.dataset)//args.batch_size , unit="batch") as tepoch: 
         for (images, labels) in  tepoch:
              # Pad the imag
-             if args.qformer or args.linear:
-                schedule.step(epoch, idx)
-             tepoch.set_description(f"Epoch {epoch}")
              images = F.pad(images, pad_dim, "constant", value=0)
              images = images.to(device)
              labels = labels.to(device)
@@ -338,23 +333,24 @@ def model_prompts_inaturalist(
                  sampled_text_inputs = text_inputs
                  repmapped_labels = labels
              selected_labels = sampled_labels 
-             _ = prompt(images, sampled_text_inputs, selected_labels)
+             pred_prompt = prompt(images, sampled_text_inputs, selected_labels, return_prompt=True)
 
-             all_prompt.extend(prompt)
-
+             all_prompt.append(pred_prompt)
              idx += 1
 
              if idx > 100:
                  break
 
 
-    all_prompt_np = np.stack(all_prompt)
+    all_prompt_np = torch.stack(all_prompt).cpu().detach().numpy()
     mean = np.mean(all_prompt_np, axis=0)
-    cov = np.cov(all_prompt_np, rowvar=0)
+    var = np.var(all_prompt_np, axis=0)
+    1/0
+
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
 
-    return mean, cov
+    return mean, var
 
 
